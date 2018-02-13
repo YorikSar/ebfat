@@ -71,10 +71,10 @@ func CreateFat(files []File, out io.Writer, label string) (err error) {
 		copy(head.PartitionLabel[:], fmt.Sprintf("%-11s", label))
 	}
 
-	fileSectorNums := make([]int64, len(files))
-	totalSectorNum := int64(0)
+	fileSectorNums := make([]uint16, len(files))
+	totalSectorNum := uint16(0)
 	for i, f := range files {
-		fileSectorNums[i] = (f.Size + 511) / 512
+		fileSectorNums[i] = uint16((f.Size + 511) / 512)
 		totalSectorNum += fileSectorNums[i]
 	}
 	if totalSectorNum > 512/3*2 { // limit FAT to one sector
@@ -93,5 +93,62 @@ func CreateFat(files []File, out io.Writer, label string) (err error) {
 		return err
 	}
 
+	fatWriter := NewFat12Writer(out)
+	fatWriter.Write(0xff8)
+	fatWriter.Write(0xfff)
+	next := uint16(3)
+	for _, n := range fileSectorNums {
+		for ; n > 1; n-- {
+			err = fatWriter.Write(next)
+			if err != nil {
+				return err
+			}
+			next += 1
+		}
+		err = fatWriter.Write(0xfff)
+		if err != nil {
+			return err
+		}
+	}
+	fatWriter.Flush()
+	fatSz := (totalSectorNum+1)/2*3 + 3 // 3 bytes for 2 clusters
+	_, err = out.Write(make([]byte, 512-fatSz))
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type Fat12Writer struct {
+	w   io.Writer
+	buf uint16
+}
+
+func NewFat12Writer(w io.Writer) *Fat12Writer {
+	return &Fat12Writer{
+		w:   w,
+		buf: 0xffff,
+	}
+}
+func (fw *Fat12Writer) Write(num uint16) error {
+	if fw.buf == 0xffff {
+		fw.buf = num
+		return nil
+	}
+	b := [3]byte{
+		byte(fw.buf & 0x0ff),
+		byte(num&0x00f<<4 + fw.buf&0xf00>>8),
+		byte(num & 0xff0 >> 4),
+	}
+	_, err := fw.w.Write(b[:])
+	fw.buf = 0xffff
+	return err
+}
+
+func (fw *Fat12Writer) Flush() error {
+	if fw.buf != 0xffff {
+		return fw.Write(0)
+	}
 	return nil
 }
