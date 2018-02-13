@@ -219,6 +219,28 @@ func CreateFat(files []File, out io.Writer, label string) (err error) {
 		}
 	}
 
+	for _, f := range files {
+		_, err = io.CopyN(out, f, f.Size)
+		if err != nil {
+			return err
+		}
+		_, err = f.Read(make([]byte, 1))
+		if err != io.EOF {
+			if err != nil {
+				return err
+			} else {
+				return fmt.Errorf("File %s is larger that %d", f.Name, f.Size)
+			}
+		}
+		padLen := 512 - f.Size%512
+		if padLen != 512 {
+			_, err := out.Write(make([]byte, padLen))
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
