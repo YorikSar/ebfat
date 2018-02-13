@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"io"
 	//"log"
+	"encoding/base32"
+	"hash/fnv"
 	"math/rand"
+	"unicode/utf16"
 )
 
 type File struct {
@@ -60,6 +63,31 @@ func init() {
 	copy(InitBootSectorHead.FileSystemType[:], fmt.Sprintf("%-8s", "FAT12"))
 }
 
+type DirEntry struct {
+	FileNameExt    [11]byte
+	Attributes     uint8 // always 0x20 - archive
+	ExtendedAttrs  uint8 // always 0x00
+	CreateTime10ms uint8
+	CreateTime     uint16
+	CreateDate     uint16
+	AccessDate     uint16
+	ExtendedAttrs1 uint16 // always 0x0000
+	ModifyTime     uint16
+	ModifyDate     uint16
+	FirstCluster   uint16
+	FileSize       uint32
+}
+type LFNEntry struct {
+	SequenceNumber    uint8
+	NamePart1         [5]uint16
+	Attributes        uint8 // always 0x0f
+	Type              uint8 // always 0x00
+	ShortNameChecksum uint8
+	NamePart2         [6]uint16
+	FirstCluster      uint16 // always 0x0000
+	NamePart3         [2]uint16
+}
+
 func CreateFat(files []File, out io.Writer, label string) (err error) {
 	head := InitBootSectorHead
 
@@ -82,6 +110,18 @@ func CreateFat(files []File, out io.Writer, label string) (err error) {
 	}
 	head.NumberOfSectors += uint16(totalSectorNum)
 
+	fileNames := make([][]uint16, len(files))
+	dirEntriesNum := uint16(0)
+	for i, f := range files {
+		fileNames[i] = utf16.Encode([]rune(f.Name))
+		if len(fileNames[i]) > 255 {
+			return fmt.Errorf("Length of filename %s is too big", f.Name)
+		}
+		dirEntriesNum += uint16(len(fileNames[i])+11)/13 + 1 // name is 0-terminated, plus one old-style entry
+	}
+	head.RootDirEntries = (dirEntriesNum + 15) & 0xfff0 // 16 per sector
+	head.NumberOfSectors += head.RootDirEntries/16 - 1
+
 	// Write first (boot) sector
 	err = binary.Write(out, binary.LittleEndian, &head)
 	if err != nil {
@@ -94,8 +134,10 @@ func CreateFat(files []File, out io.Writer, label string) (err error) {
 	}
 
 	fatWriter := NewFat12Writer(out)
-	fatWriter.Write(0xff8)
-	fatWriter.Write(0xfff)
+	fatWriter.Write(0xff8) // marker
+	for i := uint16(0); i < head.RootDirEntries/16; i++ {
+		fatWriter.Write(0xfff)
+	}
 	next := uint16(3)
 	for _, n := range fileSectorNums {
 		for ; n > 1; n-- {
@@ -111,10 +153,70 @@ func CreateFat(files []File, out io.Writer, label string) (err error) {
 		}
 	}
 	fatWriter.Flush()
-	fatSz := (totalSectorNum+1)/2*3 + 3 // 3 bytes for 2 clusters
+	fatSz := (1 + head.RootDirEntries/16 + totalSectorNum + 1) / 2 * 3 // 3 bytes for 2 clusters
 	_, err = out.Write(make([]byte, 512-fatSz))
 	if err != nil {
 		return err
+	}
+
+	lfnEntry := LFNEntry{
+		Attributes:   0x0f,
+		Type:         0x00,
+		FirstCluster: 0x0000,
+	}
+	dirEntry := DirEntry{
+		Attributes:     0x20,
+		ExtendedAttrs:  0x00,
+		CreateTime10ms: 0x00,
+		CreateTime:     0x0000, // 00:00:00
+		CreateDate:     0x0021, // 1980-01-01
+		AccessDate:     0x0021, // 1980-01-01
+		ExtendedAttrs1: 0x0000,
+		ModifyTime:     0x0000, // 00:00:00
+		ModifyDate:     0x0021, // 1980-01-01
+	}
+	curCluster := 1 + head.RootDirEntries/16
+	for i, f := range files {
+		Get83FileName(f.Name, &dirEntry.FileNameExt)
+		dirEntry.FirstCluster = curCluster
+		curCluster += fileSectorNums[i]
+		dirEntry.FileSize = uint32(f.Size)
+
+		lfnEntry.ShortNameChecksum = FileNameExtChecksum(&dirEntry.FileNameExt)
+		fileName := fileNames[i]
+		fileName = append(fileName, 0) // 0-terminated
+		padLen := (13 - len(fileName)%13) % 13
+		for j := 0; j < padLen; j++ {
+			fileName = append(fileName, 0xffff)
+		}
+		seqNum := uint8(len(fileName) / 13)
+		for start := 0; start < len(fileName); start += 13 {
+			chunk := fileName[start : start+13]
+			if start == 0 {
+				lfnEntry.SequenceNumber = 0x40 + seqNum
+			} else {
+				lfnEntry.SequenceNumber = seqNum
+			}
+			seqNum -= 1
+			copy(lfnEntry.NamePart1[:], chunk[:5])
+			copy(lfnEntry.NamePart2[:], chunk[5:11])
+			copy(lfnEntry.NamePart3[:], chunk[11:13])
+			err = binary.Write(out, binary.LittleEndian, &lfnEntry)
+			if err != nil {
+				return err
+			}
+		}
+		err = binary.Write(out, binary.LittleEndian, &dirEntry)
+		if err != nil {
+			return err
+		}
+	}
+	padLen := 512 - dirEntriesNum*32%512
+	if padLen != 512 {
+		_, err := out.Write(make([]byte, padLen))
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -151,4 +253,22 @@ func (fw *Fat12Writer) Flush() error {
 		return fw.Write(0)
 	}
 	return nil
+}
+
+func Get83FileName(fileName string, target *[11]byte) {
+	hash := fnv.New64a()
+	hash.Write([]byte(fileName))
+	hashSum := hash.Sum(nil)
+	var buf [16]byte
+	b32 := base32.NewEncoding("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345")
+	b32.Encode(buf[:], hashSum)
+	copy(target[:], buf[:11])
+}
+
+func FileNameExtChecksum(fileNameExt *[11]byte) uint8 {
+	sum := uint8(0)
+	for _, c := range fileNameExt {
+		sum = ((sum & 1) << 7) + (sum >> 1) + c
+	}
+	return sum
 }
