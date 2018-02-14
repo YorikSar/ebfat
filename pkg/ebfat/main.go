@@ -120,18 +120,18 @@ func CreateFat(files []File, out io.Writer, label string) (err error) {
 	head.RootDirEntries = (dirEntriesNum + 15) & 0xfff0 // 16 per sector
 	head.NumberOfSectors += head.RootDirEntries/16 - 1
 
+	padder := NewPaddedWriter(out, 512)
 	// Write first (boot) sector
-	err = binary.Write(out, binary.LittleEndian, &head)
+	err = binary.Write(padder, binary.LittleEndian, &head)
 	if err != nil {
 		return err
 	}
-	sz := binary.Size(&head)
-	_, err = out.Write(make([]byte, 512-sz))
+	err = padder.Pad()
 	if err != nil {
 		return err
 	}
 
-	fatWriter := NewFat12Writer(out)
+	fatWriter := NewFat12Writer(padder)
 	fatWriter.Write(0xff8) // marker
 	for i := uint16(0); i < head.RootDirEntries/16; i++ {
 		fatWriter.Write(0xfff)
@@ -151,8 +151,7 @@ func CreateFat(files []File, out io.Writer, label string) (err error) {
 		}
 	}
 	fatWriter.Flush()
-	fatSz := (1 + head.RootDirEntries/16 + totalSectorNum + 1) / 2 * 3 // 3 bytes for 2 clusters
-	_, err = out.Write(make([]byte, 512-fatSz))
+	err = padder.Pad()
 	if err != nil {
 		return err
 	}
@@ -199,26 +198,23 @@ func CreateFat(files []File, out io.Writer, label string) (err error) {
 			copy(lfnEntry.NamePart1[:], chunk[:5])
 			copy(lfnEntry.NamePart2[:], chunk[5:11])
 			copy(lfnEntry.NamePart3[:], chunk[11:13])
-			err = binary.Write(out, binary.LittleEndian, &lfnEntry)
+			err = binary.Write(padder, binary.LittleEndian, &lfnEntry)
 			if err != nil {
 				return err
 			}
 		}
-		err = binary.Write(out, binary.LittleEndian, &dirEntry)
+		err = binary.Write(padder, binary.LittleEndian, &dirEntry)
 		if err != nil {
 			return err
 		}
 	}
-	padLen := 512 - dirEntriesNum*32%512
-	if padLen != 512 {
-		_, err := out.Write(make([]byte, padLen))
-		if err != nil {
-			return err
-		}
+	err = padder.Pad()
+	if err != nil {
+		return err
 	}
 
 	for _, f := range files {
-		_, err = io.CopyN(out, f, f.Size)
+		_, err = io.CopyN(padder, f, f.Size)
 		if err != nil {
 			return err
 		}
@@ -230,12 +226,9 @@ func CreateFat(files []File, out io.Writer, label string) (err error) {
 				return fmt.Errorf("File %s is larger that %d", f.Name, f.Size)
 			}
 		}
-		padLen := 512 - f.Size%512
-		if padLen != 512 {
-			_, err := out.Write(make([]byte, padLen))
-			if err != nil {
-				return err
-			}
+		err = padder.Pad()
+		if err != nil {
+			return err
 		}
 	}
 
