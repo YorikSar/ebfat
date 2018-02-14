@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"io"
 	//"log"
-	"encoding/base32"
-	"hash/fnv"
 	"math/rand"
 	"unicode/utf16"
 )
@@ -64,7 +62,7 @@ func init() {
 }
 
 type DirEntry struct {
-	FileNameExt    [11]byte
+	FileNameExt    Dos83FileNameExt
 	Attributes     uint8 // always 0x20 - archive
 	ExtendedAttrs  uint8 // always 0x00
 	CreateTime10ms uint8
@@ -177,12 +175,12 @@ func CreateFat(files []File, out io.Writer, label string) (err error) {
 	}
 	curCluster := 1 + head.RootDirEntries/16
 	for i, f := range files {
-		Get83FileName(f.Name, &dirEntry.FileNameExt)
+		dirEntry.FileNameExt.FillFromLongName(f.Name)
 		dirEntry.FirstCluster = curCluster
 		curCluster += fileSectorNums[i]
 		dirEntry.FileSize = uint32(f.Size)
 
-		lfnEntry.ShortNameChecksum = FileNameExtChecksum(&dirEntry.FileNameExt)
+		lfnEntry.ShortNameChecksum = dirEntry.FileNameExt.LFNChecksum()
 		fileName := fileNames[i]
 		fileName = append(fileName, 0) // 0-terminated
 		padLen := (13 - len(fileName)%13) % 13
@@ -275,22 +273,4 @@ func (fw *Fat12Writer) Flush() error {
 		return fw.Write(0)
 	}
 	return nil
-}
-
-func Get83FileName(fileName string, target *[11]byte) {
-	hash := fnv.New64a()
-	hash.Write([]byte(fileName))
-	hashSum := hash.Sum(nil)
-	var buf [16]byte
-	b32 := base32.NewEncoding("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345")
-	b32.Encode(buf[:], hashSum)
-	copy(target[:], buf[:11])
-}
-
-func FileNameExtChecksum(fileNameExt *[11]byte) uint8 {
-	sum := uint8(0)
-	for _, c := range fileNameExt {
-		sum = ((sum & 1) << 7) + (sum >> 1) + c
-	}
-	return sum
 }
